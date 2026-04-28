@@ -5,7 +5,7 @@
 #include <Wire.h>
 #include <algorithm>
 #include <cstdio>
-#include <cstring>
+
 #include <math.h>
 
 
@@ -23,8 +23,6 @@
 
 namespace {
 
-constexpr uint8_t kPacketHeaderTelemetry = 0xAA;
-constexpr uint8_t kPacketHeaderHealth = 0xAB;
 
 constexpr uint8_t kI2cSdaPin = 5;
 constexpr uint8_t kI2cSclPin = 6;
@@ -47,7 +45,8 @@ constexpr uint8_t kButtonPrevPin = kButton2Pin;
 
 constexpr uint32_t kSensorPeriodMs = 20;   // 50 Hz sensor loop
 constexpr uint32_t kUiPeriodMs = 200;      // 5 Hz OLED update
-constexpr uint32_t kPacketPeriodMs = 1000; // 1 Hz packet push
+constexpr uint32_t kChunkIntervalMs = 100; // 10 Hz chunk push (all chunks cycle in ~1s)
+constexpr uint8_t kTotalChunks = 10;       // Number of BLE chunks to cycle through
 constexpr uint32_t kPhysioPeriodMs = 1000; // 1 Hz physiology sampling
 
 constexpr float kParachuteAccelThresholdG = 3.5f;
@@ -88,9 +87,7 @@ constexpr uint16_t kFlagAbnormalBehavior = (1u << 7);
 constexpr uint16_t kFlagLowBattery = (1u << 8);
 
 const char *kBleServiceUuid = "f8e2f200-bf43-4ccf-a52b-5f9d9cd10001";
-const char *kBleTelemetryUuid = "f8e2f201-bf43-4ccf-a52b-5f9d9cd10001";
-const char *kBleHealthUuid = "f8e2f202-bf43-4ccf-a52b-5f9d9cd10001";
-const char *kBleDebugJsonUuid = "f8e2f203-bf43-4ccf-a52b-5f9d9cd10001";
+const char *kBleJsonUuid = "f8e2f201-bf43-4ccf-a52b-5f9d9cd10001";
 
 enum class FlightState : uint8_t {
   IN_PLANE = 0,
@@ -172,35 +169,7 @@ private:
   size_t count_ = 0;
 };
 
-#pragma pack(push, 1)
-struct PacketAA {
-  uint8_t header;
-  uint32_t uptimeMs;
-  uint8_t state;
-  uint8_t position;
-  float bodyTemperatureC;
-  float stressPct;
-  float spo2Pct;
-  float heartRateBpm;
-  float accelMagnitudeG;
-  float gyroMagnitudeDps;
-  float batteryPct;
-  float riskScore;
-  uint16_t flags;
-  uint8_t checksum;
-};
 
-struct PacketAB {
-  uint8_t header;
-  uint32_t uptimeMs;
-  float cpuLoadPct;
-  float voltageV;
-  float currentMa;
-  float totalConsumedMah;
-  float estBatteryLifeMin;
-  uint8_t checksum;
-};
-#pragma pack(pop)
 
 struct Telemetry {
   FlightState flightState = FlightState::IN_PLANE;
@@ -255,9 +224,8 @@ RTC_DS3231 g_rtc;
 MAX30105 g_pulseSensor;
 DFRobot_BMI160 *g_bmi160 = nullptr;
 
-BLECharacteristic *g_telemetryCharacteristic = nullptr;
-BLECharacteristic *g_healthCharacteristic = nullptr;
-BLECharacteristic *g_debugJsonCharacteristic = nullptr;
+BLEServer *g_bleServer = nullptr;
+BLECharacteristic *g_jsonCharacteristic = nullptr;
 
 Telemetry g_telemetry;
 Calibration g_calibration;
@@ -265,6 +233,7 @@ Button g_nextButton(kButtonNextPin);
 Button g_prevButton(kButtonPrevPin);
 uint8_t g_activeTab = 0;
 bool g_bleClientConnected = false;
+bool g_sendTimestamp = true;
 
 SlidingWindow<100> g_accelMagnitudeWindow;
 SlidingWindow<100> g_gyroMagnitudeWindow;
@@ -272,7 +241,9 @@ SlidingWindow<8> g_pulseBeatBpmWindow;
 
 uint32_t g_lastSensorMs = 0;
 uint32_t g_lastUiMs = 0;
-uint32_t g_lastPacketMs = 0;
+uint32_t g_lastChunkMs = 0;
+uint8_t  g_currentChunk = 0;
+uint32_t g_lastBleCheckMs = 0;
 uint32_t g_lastCpuSampleMs = 0;
 uint32_t g_lastPhysioMs = 0;
 
@@ -314,13 +285,41 @@ class BleServerCallbacks final : public BLEServerCallbacks {
   void onConnect(BLEServer *server) override {
     (void)server;
     g_bleClientConnected = true;
+    g_sendTimestamp = true;
+    Serial.println("BLE: client connected");
   }
 
   void onDisconnect(BLEServer *server) override {
     g_bleClientConnected = false;
+    Serial.println("BLE: client disconnected (callback)");
+    delay(100); // Let BLE stack finish cleanup before re-advertising
     server->getAdvertising()->start();
   }
 };
+
+void pollBleConnectionState() {
+  // Ground-truth check: the BLE stack knows the real connection count.
+  // The onDisconnect callback is unreliable on ESP32-C3 (misses non-graceful
+  // disconnections like range loss or app kill).
+  if (g_bleServer == nullptr) {
+    return;
+  }
+
+  const uint32_t connectedCount = g_bleServer->getConnectedCount();
+
+  if (g_bleClientConnected && connectedCount == 0) {
+    // Callback missed the disconnect — force cleanup.
+    g_bleClientConnected = false;
+    Serial.println("BLE: stale connection detected, forcing disconnect");
+    delay(100);
+    g_bleServer->getAdvertising()->start();
+  } else if (!g_bleClientConnected && connectedCount > 0) {
+    // Callback missed the connect (rare but possible).
+    g_bleClientConnected = true;
+    g_sendTimestamp = true;
+    Serial.println("BLE: connection detected via poll");
+  }
+}
 
 BleServerCallbacks g_serverCallbacks;
 
@@ -348,13 +347,7 @@ float smoothHeartRateEstimate(float previousBpm, float candidateBpm,
   return lowPass(previousBpm, bounded, alpha);
 }
 
-uint8_t computeChecksum(const uint8_t *bytes, size_t lengthWithoutChecksum) {
-  uint8_t checksum = 0;
-  for (size_t i = 0; i < lengthWithoutChecksum; ++i) {
-    checksum ^= bytes[i];
-  }
-  return checksum;
-}
+
 
 bool updateButton(Button &button, uint32_t nowMs) {
   const bool rawPressed = digitalRead(button.pin) == LOW;
@@ -535,7 +528,7 @@ void drawTab4() {
   snprintf(value, sizeof(value), "%.1f %%", g_telemetry.riskScore);
   drawMetricRow(1, "RISK", value);
   drawMetricRow(2, "BLE", g_bleClientConnected ? "CONNECTED" : "WAITING");
-  drawMetricRow(3, "PKT", "AA/AB @ 1Hz");
+  drawMetricRow(3, "PKT", "JSON @ 1Hz");
 }
 
 void updateDisplay() {
@@ -861,15 +854,12 @@ float readBodyTemperatureC() {
 }
 
 float readExternalTemperatureC() {
-  uint16_t samples[100];
-  for (int i = 0; i < 100; i++) {
+  uint16_t samples[16];
+  for (int i = 0; i < 16; i++) {
     samples[i] = analogRead(kTempAdcPin);
-    if (i % 25 == 0) {
-      delay(1);
-    }
   }
-  std::sort(samples, samples + 100);
-  uint16_t adcRaw = samples[50]; // Median
+  std::sort(samples, samples + 16);
+  uint16_t adcRaw = samples[8]; // Median
 
   // Relaxed range to capture data even at extremes
   if (adcRaw < 1 || adcRaw > 4094) {
@@ -1253,141 +1243,109 @@ void updateCpuLoad(uint32_t nowMs) {
   g_telemetry.cpuLoadPct = duty * 100.0f;
 }
 
-void sendPackets(uint32_t nowMs) {
-  PacketAA telemetryPacket{};
-  telemetryPacket.header = kPacketHeaderTelemetry;
-  telemetryPacket.uptimeMs = nowMs;
-  telemetryPacket.state = static_cast<uint8_t>(g_telemetry.flightState);
-  telemetryPacket.position = static_cast<uint8_t>(g_telemetry.positionState);
-  telemetryPacket.bodyTemperatureC = g_telemetry.bodyTemperatureC;
-  telemetryPacket.stressPct = g_telemetry.stressPct;
-  telemetryPacket.spo2Pct = g_telemetry.bloodOxygenPct;
-  telemetryPacket.heartRateBpm = g_telemetry.heartRateBpm;
-  telemetryPacket.accelMagnitudeG = g_telemetry.accelMagnitudeG;
-  telemetryPacket.gyroMagnitudeDps = g_telemetry.gyroMagnitudeDps;
-  telemetryPacket.batteryPct = g_telemetry.batteryPct;
-  telemetryPacket.riskScore = g_telemetry.riskScore;
-  telemetryPacket.flags = g_telemetry.flags;
-  telemetryPacket.checksum =
-      computeChecksum(reinterpret_cast<const uint8_t *>(&telemetryPacket),
-                      sizeof(PacketAA) - 1);
-
-  PacketAB healthPacket{};
-  healthPacket.header = kPacketHeaderHealth;
-  healthPacket.uptimeMs = nowMs;
-  healthPacket.cpuLoadPct = g_telemetry.cpuLoadPct;
-  healthPacket.voltageV = g_telemetry.voltageV;
-  healthPacket.currentMa = g_telemetry.currentMa;
-  healthPacket.totalConsumedMah = g_telemetry.totalConsumedMah;
-  healthPacket.estBatteryLifeMin = g_telemetry.estimatedBatteryLifeMin;
-  healthPacket.checksum = computeChecksum(
-      reinterpret_cast<const uint8_t *>(&healthPacket), sizeof(PacketAB) - 1);
-
-  if (g_telemetryCharacteristic != nullptr) {
-    g_telemetryCharacteristic->setValue(
-        reinterpret_cast<uint8_t *>(&telemetryPacket), sizeof(PacketAA));
-    if (g_bleClientConnected) {
-      g_telemetryCharacteristic->notify();
-    }
+void sendTelemetryChunk(uint32_t nowMs) {
+  if (g_jsonCharacteristic == nullptr) {
+    return;
   }
 
-  if (g_healthCharacteristic != nullptr) {
-    g_healthCharacteristic->setValue(reinterpret_cast<uint8_t *>(&healthPacket),
-                                     sizeof(PacketAB));
-    if (g_bleClientConnected) {
-      g_healthCharacteristic->notify();
-    }
-  }
+  // Each chunk is a small JSON with "c" (chunk index) and 2-3 data fields.
+  // The receiver reassembles the full telemetry by merging chunks.
+  // All 10 chunks cycle every ~1 second (100ms apart).
+  StaticJsonDocument<200> doc;
+  doc["c"] = g_currentChunk;
 
-  if (g_debugJsonCharacteristic != nullptr) {
-    StaticJsonDocument<512> doc;
-    doc["device_id"] = "PARA-01"; // Unique identifier for the skydiver
+  switch (g_currentChunk) {
+  case 0:
+    doc["device_id"] = "PARA-01";
+    doc["timestamp"] = g_rtc.now().unixtime();
+    break;
 
-    // Add Unix Timestamp if RTC is running, otherwise use uptime
-    if (g_rtcReady) {
-      doc["timestamp"] = g_rtc.now().unixtime();
-    } else {
-      doc["timestamp"] = nowMs / 1000;
-    }
-
+  case 1:
     doc["state"] = toString(g_telemetry.flightState);
     doc["parachute"] =
         (g_telemetry.flags & kFlagParachuteDeployed) ? "DEPLOYED" : "STOWED";
     doc["body_position"] = toString(g_telemetry.positionState);
+    break;
+
+  case 2:
     doc["heart_rate"] = g_biometricContactDetected
-                 ? static_cast<int>(g_telemetry.heartRateBpm)
-                 : 0;
+                            ? static_cast<int>(g_telemetry.heartRateBpm)
+                            : 0;
     doc["SpO2"] = (g_biometricContactDetected && g_pulseAlgorithmStabilized)
-              ? g_telemetry.bloodOxygenPct
-              : 0.0f;
+                      ? g_telemetry.bloodOxygenPct
+                      : 0.0f;
+    break;
+
+  case 3:
     doc["temp"] = g_telemetry.bodyTemperatureC;
+    doc["temp_ext"] = isfinite(g_telemetry.externalTemperatureC)
+                          ? g_telemetry.externalTemperatureC
+                          : 0.0f;
+    break;
+
+  case 4:
     doc["stress_level"] = g_telemetry.stressPct;
     doc["is_pulse_stable"] = g_pulseAlgorithmStabilized;
+    break;
+
+  case 5:
     doc["vertical_speed"] = g_telemetry.verticalSpeedMs;
     doc["rotation"] = g_telemetry.gyroMagnitudeDps;
     doc["g_force"] = g_telemetry.accelMagnitudeG;
-    doc["temp_ext"] = isfinite(g_telemetry.externalTemperatureC)
-                 ? g_telemetry.externalTemperatureC
-                 : 0.0f;
+    break;
+
+  case 6:
     doc["battery_pct"] = g_telemetry.batteryPct;
+    doc["voltage"] = g_telemetry.voltageV;
+    break;
+
+  case 7:
+    doc["current_ma"] = g_telemetry.currentMa;
+    doc["consumed_mah"] = g_telemetry.totalConsumedMah;
+    break;
+
+  case 8:
+    doc["battery_life_min"] = g_telemetry.estimatedBatteryLifeMin;
+    doc["power_state"] = toString(g_telemetry.powerState);
+    doc["cpu_load"] = g_telemetry.cpuLoadPct;
+    break;
+
+  case 9:
     doc["risk_score"] = g_telemetry.riskScore;
-    doc["alert_active"] =
-      (g_telemetry.riskScore >= 25.0f); // Alert if risk is High
+    doc["flags"] = g_telemetry.flags;
+    doc["alert_active"] = (g_telemetry.riskScore >= 25.0f);
+    break;
 
-    char buffer[512];
-    const size_t n = serializeJson(doc, buffer, sizeof(buffer));
-    g_debugJsonCharacteristic->setValue(reinterpret_cast<uint8_t *>(buffer), n);
-    if (g_bleClientConnected) {
-      g_debugJsonCharacteristic->notify();
-    }
-
-    // Debug JSON to Serial
-    Serial.print("JSON: ");
-    serializeJson(doc, Serial);
-    Serial.println();
+  default:
+    break;
   }
 
-  Serial.printf("AA flags=0x%04X risk=%.1f state=%s pos=%s\n",
-                g_telemetry.flags, g_telemetry.riskScore,
-                toString(g_telemetry.flightState),
-                toString(g_telemetry.positionState));
-  Serial.printf("PHYS temp=%.2fC spo2=%.1f hr=%.1f contact=%s\n",
-                g_telemetry.bodyTemperatureC, g_telemetry.bloodOxygenPct,
-                g_telemetry.heartRateBpm,
-                g_biometricContactDetected ? "YES" : "NO");
-  if (g_telemetry.powerState == PowerState::CHARGING) {
-    Serial.printf(
-        "AB cpu=%.1f%% V=%.2f I=%.1f mA used=%.2f mAh life=CHARGING\n",
-        g_telemetry.cpuLoadPct, g_telemetry.voltageV, g_telemetry.currentMa,
-        g_telemetry.totalConsumedMah);
-  } else {
-    Serial.printf(
-        "AB cpu=%.1f%% V=%.2f I=%.1f mA used=%.2f mAh life=%.0f min\n",
-        g_telemetry.cpuLoadPct, g_telemetry.voltageV, g_telemetry.currentMa,
-        g_telemetry.totalConsumedMah, g_telemetry.estimatedBatteryLifeMin);
+  char buffer[200];
+  const size_t n = serializeJson(doc, buffer, sizeof(buffer));
+  g_jsonCharacteristic->setValue(reinterpret_cast<uint8_t *>(buffer), n);
+  if (g_bleClientConnected) {
+    g_jsonCharacteristic->notify();
   }
+
+  // Serial debug output (only print every full cycle to reduce serial spam)
+  if (g_currentChunk == 0) {
+    Serial.printf("BLE chunk cycle start, t=%lu\n", nowMs);
+  }
+
+  g_currentChunk = (g_currentChunk + 1) % kTotalChunks;
 }
 
 void setupBle() {
   BLEDevice::init("HS-ESP32C3-WEARABLE");
-  BLEServer *server = BLEDevice::createServer();
-  server->setCallbacks(&g_serverCallbacks);
+  g_bleServer = BLEDevice::createServer();
+  g_bleServer->setCallbacks(&g_serverCallbacks);
 
-  BLEService *service = server->createService(kBleServiceUuid);
+  BLEService *service = g_bleServer->createService(kBleServiceUuid);
 
-  g_telemetryCharacteristic = service->createCharacteristic(
-      kBleTelemetryUuid,
+  g_jsonCharacteristic = service->createCharacteristic(
+      kBleJsonUuid,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  g_healthCharacteristic = service->createCharacteristic(
-      kBleHealthUuid,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-  g_debugJsonCharacteristic = service->createCharacteristic(
-      kBleDebugJsonUuid,
-      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
-
-  g_telemetryCharacteristic->addDescriptor(new BLE2902());
-  g_healthCharacteristic->addDescriptor(new BLE2902());
-  g_debugJsonCharacteristic->addDescriptor(new BLE2902());
+  g_jsonCharacteristic->addDescriptor(new BLE2902());
 
   service->start();
 
@@ -1455,7 +1413,7 @@ void setupImpl() {
 
   g_lastSensorMs = millis();
   g_lastUiMs = g_lastSensorMs;
-  g_lastPacketMs = g_lastSensorMs;
+  g_lastChunkMs = g_lastSensorMs;
   g_lastPhysioMs = g_lastSensorMs - kPhysioPeriodMs;
 
   Serial.println("System initialized.");
@@ -1500,9 +1458,15 @@ void loopImpl() {
     updateDisplay();
   }
 
-  if ((nowMs - g_lastPacketMs) >= kPacketPeriodMs) {
-    g_lastPacketMs = nowMs;
-    sendPackets(nowMs);
+  if ((nowMs - g_lastChunkMs) >= kChunkIntervalMs) {
+    g_lastChunkMs = nowMs;
+    sendTelemetryChunk(nowMs);
+  }
+
+  // Poll real BLE connection state every 2s to catch missed callbacks
+  if ((nowMs - g_lastBleCheckMs) >= 2000) {
+    g_lastBleCheckMs = nowMs;
+    pollBleConnectionState();
   }
 
   delay(1);
