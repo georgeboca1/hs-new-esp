@@ -404,9 +404,9 @@ const char *toString(PositionState state) {
 const char *toString(PowerState state) {
   switch (state) {
   case PowerState::DISCHARGING:
-    return "DISCHRG";
+    return "DISCHARGING";
   case PowerState::CHARGING:
-    return "CHRG";
+    return "CHARGING";
   default:
     return "UNKNOWN";
   }
@@ -1257,7 +1257,7 @@ void sendTelemetryChunk(uint32_t nowMs) {
   switch (g_currentChunk) {
   case 0:
     doc["device_id"] = "PARA-01";
-    doc["timestamp"] = g_rtc.now().unixtime();
+    doc["timestamp"] = g_rtc.now().timestamp();
     break;
 
   case 1:
