@@ -1314,35 +1314,25 @@ void sendPackets(uint32_t nowMs) {
     doc["parachute"] =
         (g_telemetry.flags & kFlagParachuteDeployed) ? "DEPLOYED" : "STOWED";
     doc["body_position"] = toString(g_telemetry.positionState);
-
-    // Biometrics Object
-    JsonObject biometrics = doc.createNestedObject("biometrics");
-    biometrics["heart_rate"] = g_biometricContactDetected
-                                   ? static_cast<int>(g_telemetry.heartRateBpm)
-                                   : 0;
-    biometrics["SpO2"] =
-        (g_biometricContactDetected && g_pulseAlgorithmStabilized)
-            ? g_telemetry.bloodOxygenPct
-            : 0.0f;
-    biometrics["temp"] = g_telemetry.bodyTemperatureC;
-    biometrics["stress_level"] = g_telemetry.stressPct;
-    biometrics["is_pulse_stable"] = g_pulseAlgorithmStabilized;
-
-    // Physics Object
-    JsonObject physics = doc.createNestedObject("physics");
-    physics["vertical_speed"] = g_telemetry.verticalSpeedMs;
-    physics["rotation"] = g_telemetry.gyroMagnitudeDps;
-    physics["g_force"] = g_telemetry.accelMagnitudeG;
-    physics["temp_ext"] = isfinite(g_telemetry.externalTemperatureC)
-                              ? g_telemetry.externalTemperatureC
-                              : 0.0f;
-
-    // System Object
-    JsonObject system = doc.createNestedObject("system");
-    system["battery_pct"] = g_telemetry.batteryPct;
-    system["risk_score"] = g_telemetry.riskScore;
-    system["alert_active"] =
-        (g_telemetry.riskScore >= 25.0f); // Alert if risk is High
+    doc["heart_rate"] = g_biometricContactDetected
+                 ? static_cast<int>(g_telemetry.heartRateBpm)
+                 : 0;
+    doc["SpO2"] = (g_biometricContactDetected && g_pulseAlgorithmStabilized)
+              ? g_telemetry.bloodOxygenPct
+              : 0.0f;
+    doc["temp"] = g_telemetry.bodyTemperatureC;
+    doc["stress_level"] = g_telemetry.stressPct;
+    doc["is_pulse_stable"] = g_pulseAlgorithmStabilized;
+    doc["vertical_speed"] = g_telemetry.verticalSpeedMs;
+    doc["rotation"] = g_telemetry.gyroMagnitudeDps;
+    doc["g_force"] = g_telemetry.accelMagnitudeG;
+    doc["temp_ext"] = isfinite(g_telemetry.externalTemperatureC)
+                 ? g_telemetry.externalTemperatureC
+                 : 0.0f;
+    doc["battery_pct"] = g_telemetry.batteryPct;
+    doc["risk_score"] = g_telemetry.riskScore;
+    doc["alert_active"] =
+      (g_telemetry.riskScore >= 25.0f); // Alert if risk is High
 
     char buffer[512];
     const size_t n = serializeJson(doc, buffer, sizeof(buffer));
