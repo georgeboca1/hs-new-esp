@@ -68,6 +68,7 @@ constexpr uint16_t kPulseSampleRateHz = 100;
 constexpr uint32_t kPulseSamplePeriodMs = 1000u / kPulseSampleRateHz;
 constexpr float kPulseHrStepLimitBpm = 18.0f;
 constexpr float kPulseBeatOutlierToleranceBpm = 28.0f;
+constexpr float kVzGain = -50.0f;
 
 constexpr uint8_t kDisplayTabCount = 4;
 constexpr int16_t kUiHeaderHeight = 12;
@@ -92,8 +93,8 @@ const char *kBleJsonUuid = "f8e2f201-bf43-4ccf-a52b-5f9d9cd10001";
 enum class FlightState : uint8_t {
   IN_PLANE = 0,
   FREEFALL = 1,
-  DEPLOYMENT = 2,
-  CANOPY_DESCENT = 3,
+  CANOPY = 2,
+  LANDED = 3,
 };
 
 enum class PositionState : uint8_t {
@@ -235,8 +236,8 @@ uint8_t g_activeTab = 0;
 bool g_bleClientConnected = false;
 bool g_sendTimestamp = true;
 
-SlidingWindow<100> g_accelMagnitudeWindow;
-SlidingWindow<100> g_gyroMagnitudeWindow;
+SlidingWindow<20> g_accelMagnitudeWindow;
+SlidingWindow<20> g_gyroMagnitudeWindow;
 SlidingWindow<8> g_pulseBeatBpmWindow;
 
 uint32_t g_lastSensorMs = 0;
@@ -247,9 +248,6 @@ uint32_t g_lastBleCheckMs = 0;
 uint32_t g_lastCpuSampleMs = 0;
 uint32_t g_lastPhysioMs = 0;
 
-uint32_t g_freefallCandidateStartMs = 0;
-uint32_t g_openingShockStartMs = 0;
-uint32_t g_deploymentMs = 0;
 uint32_t g_excessiveRotationStartMs = 0;
 uint32_t g_immobilityStartMs = 0;
 uint32_t g_lastNormalGravityMs = 0;
@@ -375,10 +373,10 @@ const char *toString(FlightState state) {
     return "IN_PLANE";
   case FlightState::FREEFALL:
     return "FREEFALL";
-  case FlightState::DEPLOYMENT:
-    return "DEPLOYMENT";
-  case FlightState::CANOPY_DESCENT:
+  case FlightState::CANOPY:
     return "CANOPY";
+  case FlightState::LANDED:
+    return "LANDED";
   default:
     return "UNKNOWN";
   }
@@ -492,7 +490,8 @@ void drawTab2() {
   char value[24];
 
   drawMetricRow(0, "STATE", toString(g_telemetry.flightState));
-  drawMetricRow(1, "POS", toString(g_telemetry.positionState));
+  snprintf(value, sizeof(value), "%+.1f m/s", g_telemetry.verticalSpeedMs);
+  drawMetricRow(1, "VZ", value);
   snprintf(value, sizeof(value), "%.2f g", g_telemetry.accelMagnitudeG);
   drawMetricRow(2, "|A|", value);
   snprintf(value, sizeof(value), "%.1f dps", g_telemetry.gyroMagnitudeDps);
@@ -574,14 +573,14 @@ void updateOrientation(float dtSeconds) {
       atan2f(-ax, sqrtf((ay * ay) + (az * az))) * (180.0f / PI);
   const float rollAcc = atan2f(ay, az) * (180.0f / PI);
 
-  // Lightweight fusion: gyro integrates fast motion, accel corrects gravity
-  // drift.
+  // Complementary filter: gyro integrates fast motion, accel corrects gravity drift.
+  // Weights (0.96 / 0.04) provide a ~0.25s time constant at 50Hz for faster correction.
   g_telemetry.orientation.pitchDeg =
-      (0.98f * (g_telemetry.orientation.pitchDeg + (gy * dtSeconds))) +
-      (0.02f * pitchAcc);
+      (0.96f * (g_telemetry.orientation.pitchDeg + (gy * dtSeconds))) +
+      (0.04f * pitchAcc);
   g_telemetry.orientation.rollDeg =
-      (0.98f * (g_telemetry.orientation.rollDeg + (gx * dtSeconds))) +
-      (0.02f * rollAcc);
+      (0.96f * (g_telemetry.orientation.rollDeg + (gx * dtSeconds))) +
+      (0.04f * rollAcc);
   g_telemetry.orientation.yawDeg += gz * dtSeconds;
 
   if (g_telemetry.orientation.yawDeg > 180.0f) {
@@ -600,8 +599,8 @@ void updateDerivedMetrics(float dtSeconds) {
   g_prevGyroMagLp =
       lowPass(g_prevGyroMagLp, g_telemetry.gyroMagnitudeDps, 0.2f);
 
-  g_accelMagnitudeWindow.add(g_prevAccelMagLp);
-  g_gyroMagnitudeWindow.add(g_prevGyroMagLp);
+  g_accelMagnitudeWindow.add(g_telemetry.accelMagnitudeG);
+  g_gyroMagnitudeWindow.add(g_telemetry.gyroMagnitudeDps);
 
   const float normalizedMotion =
       constrain(g_gyroMagnitudeWindow.variance() / 3500.0f, 0.0f, 1.0f);
@@ -646,24 +645,68 @@ void updateDerivedMetrics(float dtSeconds) {
     g_telemetry.estimatedBatteryLifeMin = -1.0f;
   }
 
-  // Vertical Speed Estimation (Simplified for skydive context)
-  if (g_telemetry.flightState == FlightState::FREEFALL) {
-    // In freefall, we accelerate towards terminal velocity (~55 m/s)
-    // We use the accelerometer to detect if we are tracking or belly flying
-    float targetSpeed =
-        (g_telemetry.positionState == PositionState::VERTICAL) ? 75.0f : 54.0f;
-    g_telemetry.verticalSpeedMs =
-        lowPass(g_telemetry.verticalSpeedMs, targetSpeed, 0.05f);
-  } else if (g_telemetry.flightState == FlightState::CANOPY_DESCENT) {
-    g_telemetry.verticalSpeedMs =
-        lowPass(g_telemetry.verticalSpeedMs, 5.0f, 0.1f);
-  } else if (g_telemetry.flightState == FlightState::DEPLOYMENT) {
-    // Rapid deceleration during opening shock
-    g_telemetry.verticalSpeedMs =
-        lowPass(g_telemetry.verticalSpeedMs, 10.0f, 0.3f);
-  } else {
-    g_telemetry.verticalSpeedMs =
-        lowPass(g_telemetry.verticalSpeedMs, 0.0f, 0.2f);
+  // --- Redone Vertical Speed Implementation (V2) ---
+  // High-performance IMU-only variometer using orientation-aware gravity projection.
+  // Correctly maps Downward movement to Positive values.
+
+  // 1. Compute unit gravity vector in body frame from filtered orientation
+  const float pRad = g_telemetry.orientation.pitchDeg * (PI / 180.0f);
+  const float rRad = g_telemetry.orientation.rollDeg * (PI / 180.0f);
+  const float gbx = -sinf(pRad);
+  const float gby = cosf(pRad) * sinf(rRad);
+  const float gbz = cosf(pRad) * cosf(rRad);
+
+  // 2. Project current acceleration onto the gravity axis (World-UP)
+  const float worldUpAccG = (g_telemetry.accelG.x * gbx +
+                             g_telemetry.accelG.y * gby +
+                             g_telemetry.accelG.z * gbz);
+
+  // 3. Motion state detection for ZVU (Zero Velocity Update)
+  const float gyroVar = g_gyroMagnitudeWindow.variance();
+  const float accelVar = g_accelMagnitudeWindow.variance();
+  const bool isStill = (gyroVar < 4.5f && accelVar < 0.0028f);
+
+  // 4. Dynamic Bias Tracking
+  // We track the 1.0g reference. Rapid convergence when still, ultra-slow when moving.
+  static float vAccBiasG = 1.0f;
+  static bool vAccBiasSeeded = false;
+  if (!vAccBiasSeeded) {
+    vAccBiasG = worldUpAccG;
+    vAccBiasSeeded = true;
+  }
+  // Very slow bias tracking to avoid eating real motion.
+  vAccBiasG = lowPass(vAccBiasG, worldUpAccG, isStill ? 0.025f : 0.00005f);
+
+  // 5. Compute Clean Vertical Acceleration (Up = Positive)
+  // If worldUpAccG > bias (e.g. accelerating up), result is positive.
+  const float cleanAccelUpG = worldUpAccG - vAccBiasG;
+
+  // 6. Velocity Integration with Leaky Damping
+  // Leakage prevents long-term drift since we lack an absolute reference (Baro).
+  // Increased gain (15x) for massive responsiveness.
+  const float leakAlpha = isStill ? 0.965f : 0.9998f;
+  g_telemetry.verticalSpeedMs =
+      (g_telemetry.verticalSpeedMs +
+       (cleanAccelUpG * 9.81f * dtSeconds * kVzGain)) *
+      leakAlpha;
+
+  // 7. Residual Snap-to-Zero
+  if (isStill && fabsf(g_telemetry.verticalSpeedMs) < 0.25f) {
+    g_telemetry.verticalSpeedMs = 0.0f;
+  }
+
+  // 8. Output Clipping (Up is positive, Down is negative)
+  // Expanded range for high-gain testing.
+  g_telemetry.verticalSpeedMs =
+      constrain(g_telemetry.verticalSpeedMs, -350.0f, 150.0f);
+
+  static uint32_t lastVzLogMs = 0;
+  if (millis() - lastVzLogMs > 250) {
+    lastVzLogMs = millis();
+    Serial.printf(
+        "VARIO: Proj:%.3f Bias:%.3f CleanG:%+.3f Still:%d VZ:%+.2f m/s\n",
+        worldUpAccG, vAccBiasG, cleanAccelUpG, (int)isStill,
+        g_telemetry.verticalSpeedMs);
   }
 }
 
@@ -680,46 +723,37 @@ void updateFlightAndRisk(uint32_t nowMs) {
   }
   const bool freefallArmed = g_lastNormalGravityMs != 0;
 
-  if (g_telemetry.flightState == FlightState::IN_PLANE) {
-    if (freefallArmed &&
-        g_prevAccelMagLp < 0.45f) { // Increased threshold for easier simulation
-      if (g_freefallCandidateStartMs == 0) {
-        g_freefallCandidateStartMs = nowMs;
-      }
-      if ((nowMs - g_freefallCandidateStartMs) >
-          200) { // Reduced duration for faster response
-        g_telemetry.flightState = FlightState::FREEFALL;
-      }
-    } else {
-      g_freefallCandidateStartMs = 0;
+  switch (g_telemetry.flightState) {
+  case FlightState::IN_PLANE:
+    // Any significant descent (e.g. > 5m/s) triggers transition to FREEFALL.
+    // Higher speeds will still pass through FREEFALL to CANOPY in subsequent steps.
+    if (g_telemetry.verticalSpeedMs > 5.0f) {
+      g_telemetry.flightState = FlightState::FREEFALL;
+      Serial.println("FLIGHT: State -> FREEFALL");
     }
-  }
+    break;
 
-  if (g_telemetry.flightState == FlightState::FREEFALL) {
-    if (g_prevAccelMagLp > kParachuteAccelThresholdG) {
-      if (g_openingShockStartMs == 0) {
-        g_openingShockStartMs = nowMs;
-      }
-      if ((nowMs - g_openingShockStartMs) >= kParachuteAccelDurationMs) {
-        g_telemetry.flightState = FlightState::DEPLOYMENT;
-        g_deploymentMs = nowMs;
-        flags |= kFlagParachuteDeployed;
-      }
-    } else {
-      g_openingShockStartMs = 0;
+  case FlightState::FREEFALL:
+    // Transition to CANOPY when speed drops below 25m/s.
+    if (g_telemetry.verticalSpeedMs <= 25.0f) {
+      g_telemetry.flightState = FlightState::CANOPY;
+      Serial.println("FLIGHT: State -> CANOPY");
     }
-  }
+    break;
 
-  if (g_telemetry.flightState == FlightState::DEPLOYMENT) {
+  case FlightState::CANOPY:
     flags |= kFlagParachuteDeployed;
-    if ((nowMs - g_deploymentMs) > 3000 && g_prevAccelMagLp > 0.7f &&
-        g_prevAccelMagLp < 1.6f) {
-      g_telemetry.flightState = FlightState::CANOPY_DESCENT;
+    // Transition to LANDED when speed is near zero.
+    if (g_telemetry.verticalSpeedMs <= 0.8f) {
+      g_telemetry.flightState = FlightState::LANDED;
+      Serial.println("FLIGHT: State -> LANDED");
     }
-  }
+    break;
 
-  if (g_telemetry.flightState == FlightState::CANOPY_DESCENT) {
+  case FlightState::LANDED:
     flags |= kFlagParachuteDeployed;
+    // Stay in LANDED until manual reset or stationary timeout.
+    break;
   }
 
   if (g_prevGyroMagLp > kExcessiveRotationThresholdDps) {
@@ -741,9 +775,19 @@ void updateFlightAndRisk(uint32_t nowMs) {
     if (g_immobilityStartMs == 0) {
       g_immobilityStartMs = nowMs;
     }
+    // Stationary Reset: Only return to IN_PLANE from LANDED to maintain strict sequence.
+    // If we are stationary in other states, the speed-based logic above will
+    // naturally transition us through the sequence (FREEFALL -> CANOPY -> LANDED).
+    if ((nowMs - g_immobilityStartMs) >= 8000) {
+      if (g_telemetry.flightState == FlightState::LANDED) {
+        Serial.println("FLIGHT: Stationary reset -> IN_PLANE");
+        g_telemetry.flightState = FlightState::IN_PLANE;
+      }
+    }
     // Only flag immobility as a risk if we are actually in a flight phase
     if ((nowMs - g_immobilityStartMs) >= kImmobilityDurationMs &&
-        g_telemetry.flightState != FlightState::IN_PLANE) {
+        g_telemetry.flightState != FlightState::IN_PLANE &&
+        g_telemetry.flightState != FlightState::LANDED) {
       flags |= kFlagImmobility;
     }
   } else {
@@ -1077,6 +1121,8 @@ void updateImuReadings() {
     i2cErrorCount++;
     if (i2cErrorCount > 10) {
       Serial.println("IMU I2C FAIL - RECOVERY...");
+      Wire.begin(kI2cSdaPin, kI2cSclPin); // Ensure pins are still correct
+      Wire.setClock(100000);              // Keep it at 100kHz
       g_bmi160->softReset();
       g_bmi160->I2cInit(kBmi160Address);
       i2cErrorCount = 0;
@@ -1386,7 +1432,7 @@ void setupImpl() {
     g_rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
   }
 
-  g_pulseReady = g_pulseSensor.begin(Wire, I2C_SPEED_FAST, kMax3010xAddress);
+  g_pulseReady = g_pulseSensor.begin(Wire, 100000, kMax3010xAddress);
   if (g_pulseReady) {
     const byte ledBrightness = 0x24; // ~7.6mA
     const byte sampleAverage = 1;    // No hardware averaging for sharpest peaks
@@ -1410,6 +1456,9 @@ void setupImpl() {
 
   calibrateSensors();
   setupBle();
+
+  // Final lock on I2C speed after all sensors have likely messed with it
+  Wire.setClock(100000);
 
   g_lastSensorMs = millis();
   g_lastUiMs = g_lastSensorMs;
